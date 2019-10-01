@@ -70,6 +70,9 @@ def initialize_error_file():
         f.write("Row,URL,ErrorType\n")
 
 async def chain_processing(file_name, session, url):
+    """
+    Chaining of tasks and writing error to the log with appropriate type
+    """
     try:
         resp = await get_article(url,session)
     except:
@@ -91,6 +94,11 @@ async def chain_processing(file_name, session, url):
     
 @lru_cache()
 def get_prepared_data():
+    """
+    Get the kaggle data and clean up the bad links as described in the jupyter notebook.
+    This gets called from the main loop every batch, however since we're using the lru_cache
+      the code is ever actually run once (as you can see from the print statement).
+    """
     print('Preparing Data')
     df = pd.read_json('data/News_Category_Dataset.json', lines=True, orient='records')
     p=re.compile(r'(?<=www\.).+(?=\.com)')
@@ -102,18 +110,43 @@ def get_prepared_data():
         else:
             return tmp.group()
 
+    # Remove Links to Other Sites
     df['root'] = df.link.apply(get_root)
     mismatches = df[df.root!='huffingtonpost']['link']
     print(f"Total number of news articles = {len(df)}\nNumber of mismatches = {len(mismatches)}\n")
+
+    # Remove Double Links
+    p = re.compile('(?<=https://).+(?=(http://|https://))')
+    double_link_idx = df[df['link'].apply(lambda x: p.search(x) is not None)].index
+
     
     df.drop(mismatches.index, inplace=True)
+    df.drop([x for x in double_link_idx if x not in mismatches.index], inplace=True)
     return df
 
 async def main(start, stop):
+    """
+    Main scraping loop sends requests asynchronously from start (inclusive) to stop (exclusive)
+    """
     df = get_prepared_data()
+    initialize_error_file()
     async with ClientSession() as session:
         names = df.index.to_list()[start:stop]
         urls = df.link.to_list()[start:stop]
+        tasks = [asyncio.create_task(chain_processing(name, session, url)) for name, url in zip(names, urls)]
+        await asyncio.gather(*tasks)
+
+async def rerun_errors():
+    """
+    Use this after running the main scraper to clean up errors
+    """
+    df = get_prepared_data()
+    error_df = pd.read_csv('error_locations.csv', index_col=0)
+    
+    initialize_error_file()
+    async with ClientSession() as session:
+        names = df.loc[[x for x in error_df.index if x in df.index]].index.to_list()
+        urls = df.loc[[x for x in error_df.index if x in df.index]].link.to_list()
         tasks = [asyncio.create_task(chain_processing(name, session, url)) for name, url in zip(names, urls)]
         await asyncio.gather(*tasks)
 
@@ -121,13 +154,17 @@ if __name__=='__main__':
     import time
     batch_size = 600
     dataset_size = 124989 #dataset size hardcoded here- not the best practice
-    initialize_error_file()
-
     s_time = time.time()
+
+    # Main scraping loop with sleep to avoid throttling
     for start in range(0,dataset_size,batch_size): 
         print(f"Running for {start}")
         asyncio.run(main(start=start, stop=start+batch_size))
         time.sleep(30)
+
+    # Rerunning errors
+    #asyncio.run(rerun_errors())
+
     e_time = time.time()
     hours = (e_time - s_time) // 3600
     minutes = (e_time - s_time) // 60 - 60*hours
